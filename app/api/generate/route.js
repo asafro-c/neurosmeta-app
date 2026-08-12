@@ -1,14 +1,16 @@
 /**
- * POST /api/generate — трёхэтапная генерация сметы.
+ * POST /api/generate — четырёхэтапная генерация сметы.
  *
- * Этап 1: Claude анализирует документы → JSON (работы с объёмами + материалы с ценами, work_rate=0)
- * Этап 2: Сервер + Claude мини-запрос → подбор расценок из справочника
- * Этап 3: Сервер → подстановка цен × Кинф × Кмск → Excel → email
+ * Этап 1: Claude анализирует документы → JSON (работы + материалы, work_rate=0, цены ориентировочные)
+ * Этап 2: Сервер + Claude мини → подбор расценок на работы из справочника
+ * Этап 3: Claude + web_search → поиск актуальных цен на материалы в petrovich.ru
+ * Этап 4: Сервер → сборка Excel → отправка email
  */
 
 import { NextResponse } from "next/server";
 import { generateEstimate } from "@/lib/claude";
 import { matchAllRates } from "@/lib/price-matcher";
+import { updateMaterialPrices } from "@/lib/material-prices";
 import { generateExcel } from "@/lib/excel";
 import { sendEstimateToClient, notifyOwner } from "@/lib/email";
 import { getPrice } from "@/lib/tariffs";
@@ -36,32 +38,21 @@ export async function POST(request) {
       path: f.path || null,
     }));
 
-    // ========== ЭТАП 1: Claude анализирует документы ==========
-    console.log("[generate] ЭТАП 1: Claude API call for", order.email, "files:", files.length);
+    // ===== ЭТАП 1: Claude анализирует документы =====
+    console.log("[generate] ЭТАП 1: Claude API — анализ документов, files:", files.length);
     const estimateData = await generateEstimate(order, files);
-    console.log("[generate] ЭТАП 1 done. Sections:", estimateData.sections?.length);
+    const posCount = (estimateData.sections || []).reduce((s, sec) => s + (sec.positions || []).length, 0);
+    console.log("[generate] ЭТАП 1 done. Sections:", estimateData.sections?.length, "Positions:", posCount);
 
-    // ========== ЭТАП 2-3: Подбор расценок из справочника ==========
-    console.log("[generate] ЭТАП 2-3: Matching work rates from price DB");
-    
-    // Собираем все позиции работ
+    // ===== ЭТАП 2: Подбор расценок из справочника =====
+    console.log("[generate] ЭТАП 2: Matching work rates");
     const allWorkItems = [];
     for (const section of estimateData.sections || []) {
       for (const pos of section.positions || []) {
-        allWorkItems.push({
-          sectionName: section.name,
-          num: pos.num,
-          name: pos.name,
-          unit: pos.unit,
-          qty: pos.qty,
-        });
+        allWorkItems.push({ name: pos.name, unit: pos.unit, qty: pos.qty });
       }
     }
-
-    // Матчим расценки
     const matchedItems = await matchAllRates(allWorkItems, order.region);
-
-    // Подставляем расценки обратно в estimateData
     let matchIdx = 0;
     for (const section of estimateData.sections || []) {
       for (const pos of section.positions || []) {
@@ -72,16 +63,18 @@ export async function POST(request) {
         }
       }
     }
+    const rateOk = matchedItems.filter(m => m.work_rate > 0).length;
+    console.log("[generate] ЭТАП 2 done. Rates matched:", rateOk + "/" + matchedItems.length);
 
-    const matchedCount = matchedItems.filter(m => m.work_rate > 0).length;
-    const totalCount = matchedItems.length;
-    console.log("[generate] ЭТАП 2-3 done. Matched:", matchedCount, "/", totalCount);
+    // ===== ЭТАП 3: Поиск актуальных цен на материалы =====
+    console.log("[generate] ЭТАП 3: Material price lookup via web_search");
+    await updateMaterialPrices(estimateData, order.region);
+    console.log("[generate] ЭТАП 3 done.");
 
-    // ========== ГЕНЕРАЦИЯ EXCEL ==========
+    // ===== ЭТАП 4: Генерация Excel и отправка =====
     const excelBuffer = await generateExcel(estimateData);
-    console.log("[generate] Excel generated:", excelBuffer.length, "bytes");
+    console.log("[generate] Excel:", excelBuffer.length, "bytes");
 
-    // ========== ОТПРАВКА EMAIL ==========
     const workTypeRu = { cosmetic: "Косметический_ремонт", capital: "Капитальный_ремонт", construction: "Строительство", landscaping: "Благоустройство" };
     const filename = "Смета_" + (workTypeRu[order.workType] || order.workType) + "_" + order.area + "м2.xlsx";
     const objectDesc = estimateData.meta?.subtitle || order.area + " м², " + order.region;
@@ -96,9 +89,8 @@ export async function POST(request) {
       message: "Смета отправлена на " + order.email,
       stats: {
         sections: estimateData.sections?.length,
-        positions: totalCount,
-        matched_rates: matchedCount,
-        unmatched_rates: totalCount - matchedCount,
+        positions: posCount,
+        matched_rates: rateOk,
         rooms: estimateData.rooms?.length,
         fileSize: excelBuffer.length,
       },
@@ -108,6 +100,6 @@ export async function POST(request) {
     if (order) {
       await notifyOwner({ ...order, price: 0, fileCount: 0 }, "error", err.message).catch(console.error);
     }
-    return NextResponse.json({ error: "Ошибка генерации сметы", details: err.message }, { status: 500 });
+    return NextResponse.json({ error: "Ошибка генерации", details: err.message }, { status: 500 });
   }
 }
